@@ -1,0 +1,418 @@
+// ==UserScript==
+// @name         MSE 微课 · Unit1-8 Section C 自动挂机（带状态栏）
+// @namespace    https://microlesson.rcgtjy.com/
+// @version      1.1.0
+// @description  课程页顶部固定状态栏：实时显示脚本是否在跑、媒体是否在播、本节剩余时间、已完成几节；满 10 分钟自动跳下一个小节，跑完 Unit1-8 的 Part II Section C 共 24 节。
+// @author       local
+// @match        https://microlesson.rcgtjy.com/Adm/CourseStruct/StudentDetail*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+/* 说明：
+ * 1) 脚本一注入就先在控制台打一行 [MSE-AUTO]，方便确认「到底有没有装/有没有跑」。
+ * 2) 顶部状态栏每秒刷新一次，含「心跳 Ns 前」——那个数字在变，就说明脚本活着。
+ * 3) 任何异常都被捕获并显示在状态栏（红色），不会再静默失效。
+ */
+
+(function () {
+  'use strict';
+
+  const VERSION = '1.1.0';
+  const TAG = '[MSE-AUTO]';
+  console.log(TAG, 'v' + VERSION, '注入成功，url =', location.href);
+
+  /* ============================ 配置 ============================ */
+
+  const CFG = {
+    PER_NODE_SECONDS: 10 * 60,   // 每节挂机秒数
+    OPEN_EXERCISE_TAB: true,     // 自动切到「课堂练习」页签
+    MUTE_MEDIA: true,            // 静音播放（浏览器只允许静音自动播）
+    PLAYBACK_RATE: 1,
+    ACTIVITY_EVERY: 20,          // 每 20 秒模拟一次页面活动
+    COUNT_ONLY_VISIBLE: false,   // true = 切到别的标签页就暂停计时
+    AUTO_START: true,            // false = 进页面不自动跑，点状态栏「继续」再开始
+
+    IDS: [
+      400979, 400980, 400981,   // Unit 1  Job Hunting
+      400990, 400995, 401000,   // Unit 2  Further Education
+      401007, 401012, 401017,   // Unit 3  Interdisciplinary Cooperation
+      401024, 401029, 401034,   // Unit 4  Conferences
+      401041, 401046, 401051,   // Unit 5  Social Etiquette
+      401058, 401063, 401068,   // Unit 6  Communication Skills
+      401075, 401080, 401085,   // Unit 7  Healthy Lifestyle
+      401092, 401097, 401102    // Unit 8  Artificial Intelligence
+    ],
+
+    KEY_DONE: 'mse_auto_done_v1',
+    KEY_PAUSE: 'mse_auto_paused_v1'
+  };
+
+  /* ============================ 基础 ============================ */
+
+  const qs = new URLSearchParams(location.search);
+  const CUR_ID = Number(qs.get('courseStructId') || 0);
+  const IDX = CFG.IDS.indexOf(CUR_ID);
+  const now = () => Date.now();
+  const pad = n => String(n).padStart(2, '0');
+  const mmss = ms => {
+    const s = Math.max(0, Math.ceil(ms / 1000));
+    return pad(Math.floor(s / 60)) + ':' + pad(s % 60);
+  };
+  const lsGet = (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } };
+  const lsSet = (k, v) => { try { localStorage.setItem(k, String(v)); } catch (e) { } };
+  const lsGetArr = (k, d) => { try { return JSON.parse(localStorage.getItem(k) || 'null') || d; } catch (e) { return d; } };
+
+  let doneIds = lsGetArr(CFG.KEY_DONE, []);
+  let paused = lsGet(CFG.KEY_PAUSE, 'false') === 'true';
+  if (!CFG.AUTO_START) paused = true;
+
+  /* ======================== 状态栏 UI ======================== */
+
+  const UI = {
+    root: null, dot: null, state: null, main: null, heart: null, detail: null,
+    btnToggle: null, mediaDesc: '', lastBeat: 0, startedAt: now(), ticks: 0, err: ''
+  };
+
+  const CSS = [
+    '#mse-auto-bar{position:fixed;left:0;right:0;bottom:0;z-index:2147483647;',
+    'font:12px/1.5 "Microsoft YaHei",system-ui,-apple-system,sans-serif;color:#e5e7eb;',
+    'background:rgba(15,23,42,.95);box-shadow:0 -2px 10px rgba(0,0,0,.4);user-select:none}',
+    '#mse-auto-bar .mrow{display:flex;align-items:center;gap:10px;padding:6px 12px;flex-wrap:wrap}',
+    '#mse-auto-bar .dot{width:9px;height:9px;border-radius:50%;background:#ef4444;box-shadow:0 0 8px currentColor;flex:0 0 auto}',
+    '#mse-auto-bar .dot.run{background:#22c55e}',
+    '#mse-auto-bar .dot.pause{background:#f59e0b}',
+    '#mse-auto-bar b{color:#93c5fd;font-weight:600}',
+    '#mse-auto-bar .sep{color:#475569}',
+    '#mse-auto-bar .btn{border:0;border-radius:6px;padding:3px 9px;cursor:pointer;font-size:12px;background:#334155;color:#e2e8f0}',
+    '#mse-auto-bar .btn:hover{background:#475569}',
+    '#mse-auto-bar .btn.pri{background:#2563eb;color:#fff}',
+    '#mse-auto-bar .grow{flex:1 1 auto}',
+    '#mse-auto-bar .detail{display:none;border-top:1px solid rgba(148,163,184,.25);padding:8px 12px;font-size:11px;line-height:1.7;color:#cbd5e1;max-height:38vh;overflow:auto}',
+    '#mse-auto-bar.open .detail{display:block}',
+    '#mse-auto-bar .detail code{color:#fbbf24;background:rgba(0,0,0,.3);padding:0 4px;border-radius:3px}',
+    '#mse-auto-bar .err{color:#fca5a5}'
+  ].join('');
+
+  function buildUI() {
+    if (UI.root && document.body && document.body.contains(UI.root)) return true;
+    if (!document.body) return false;
+
+    if (!document.getElementById('mse-auto-style')) {
+      const st = document.createElement('style');
+      st.id = 'mse-auto-style';
+      st.textContent = CSS;
+      (document.head || document.documentElement).appendChild(st);
+    }
+
+    const bar = document.createElement('div');
+    bar.id = 'mse-auto-bar';
+    bar.innerHTML =
+      '<div class="mrow">' +
+      '<span class="dot" id="mse-auto-dot"></span>' +
+      '<b id="mse-auto-state">初始化…</b>' +
+      '<span class="sep">|</span>' +
+      '<span id="mse-auto-main">等待课程内容</span>' +
+      '<span class="grow"></span>' +
+      '<span id="mse-auto-heart" style="color:#64748b">心跳 --</span>' +
+      '<button class="btn pri" id="mse-auto-toggle">暂停</button>' +
+      '<button class="btn" id="mse-auto-skip">跳过本节</button>' +
+      '<button class="btn" id="mse-auto-reset">重置</button>' +
+      '<button class="btn" id="mse-auto-fold">详情</button>' +
+      '</div><div class="detail" id="mse-auto-detail"></div>';
+    document.body.appendChild(bar);
+
+    UI.root = bar;
+    UI.dot = document.getElementById('mse-auto-dot');
+    UI.state = document.getElementById('mse-auto-state');
+    UI.main = document.getElementById('mse-auto-main');
+    UI.heart = document.getElementById('mse-auto-heart');
+    UI.detail = document.getElementById('mse-auto-detail');
+    UI.btnToggle = document.getElementById('mse-auto-toggle');
+
+    document.getElementById('mse-auto-fold').addEventListener('click', function () {
+      bar.classList.toggle('open');
+      this.textContent = bar.classList.contains('open') ? '收起' : '详情';
+    });
+    UI.btnToggle.addEventListener('click', () => {
+      paused = !paused;
+      lsSet(CFG.KEY_PAUSE, paused);
+      UI.btnToggle.textContent = paused ? '继续' : '暂停';
+      render();
+    });
+    document.getElementById('mse-auto-skip').addEventListener('click', () => skipCurrent());
+    document.getElementById('mse-auto-reset').addEventListener('click', () => {
+      doneIds = [];
+      lsSet(CFG.KEY_DONE, '[]');
+      location.href = urlFor(CFG.IDS[0]);
+    });
+    return true;
+  }
+
+  function setBar(mode, stateText, mainText) {
+    if (!UI.root) return;
+    UI.dot.className = 'dot ' + (mode || '');
+    if (stateText != null) UI.state.textContent = stateText;
+    if (mainText != null) UI.main.textContent = mainText;
+  }
+
+  function render() {
+    if (!UI.root) return;
+    const beat = UI.lastBeat ? Math.round((now() - UI.lastBeat) / 1000) : -1;
+    UI.heart.textContent = beat >= 0 ? '心跳 ' + beat + 's 前' : '心跳 --';
+    UI.heart.style.color = beat >= 0 && beat <= 3 ? '#22c55e' : '#64748b';
+    const rows = [
+      '脚本版本 <code>v' + VERSION + '</code>　本页运行 <code>' + mmss(now() - UI.startedAt) + '</code>　tick <code>' + UI.ticks + '</code>',
+      'courseStructId <code>' + CUR_ID + '</code>　位置 <code>' + (IDX >= 0 ? (IDX + 1) + '/' + CFG.IDS.length : '不在列表') + '</code>',
+      '已完成 <code>' + doneIds.length + '/' + CFG.IDS.length + '</code>　暂停 <code>' + paused + '</code>　可见 <code>' + (document.visibilityState === 'visible') + '</code>',
+      '媒体 <code>' + (UI.mediaDesc || '—') + '</code>',
+      '配置 每节 <code>' + CFG.PER_NODE_SECONDS + 's</code>　静音 <code>' + CFG.MUTE_MEDIA + '</code>　仅可见计时 <code>' + CFG.COUNT_ONLY_VISIBLE + '</code>',
+      UI.err ? '<span class="err">最近异常：' + UI.err + '</span>' : '',
+      '<span style="color:#64748b">心跳数字每 1—3 秒变一次 = 脚本在跑；长时间不变 = 已停。</span>'
+    ];
+    UI.detail.innerHTML = rows.filter(Boolean).join('<br>');
+  }
+
+  function fatal(e) {
+    UI.err = (e && (e.message || e)) + '';
+    console.error(TAG, '出错：', e);
+    setBar('', '脚本异常', '展开「详情」看异常信息');
+    if (UI.root) UI.root.classList.add('open');
+    render();
+  }
+
+  /* ====================== 媒体 / 页面操作 ====================== */
+
+  const MEDIA_SELECTORS = [
+    '#content-Audio .audioBox audio',
+    '#content-Video .videoBox video',
+    '.audioBox audio', '.videoBox video',
+    '#subjectPagerBox audio', '#subjectPagerBox video',
+    'audio', 'video'
+  ];
+
+  function findMedia() {
+    for (const sel of MEDIA_SELECTORS) {
+      const list = document.querySelectorAll(sel);
+      for (const el of list) {
+        if (el.getAttribute('src') || el.currentSrc || el.querySelector('source')) return el;
+      }
+    }
+    for (const el of document.querySelectorAll('audio,video')) {
+      if (el.getAttribute('src') || el.currentSrc) return el;
+    }
+    return null;
+  }
+
+  function keepPlaying(el) {
+    if (!el) return;
+    try {
+      el.loop = true;
+      if (CFG.PLAYBACK_RATE && Math.abs(el.playbackRate - CFG.PLAYBACK_RATE) > 0.01) el.playbackRate = CFG.PLAYBACK_RATE;
+      if (CFG.MUTE_MEDIA) el.muted = true;
+      if (el.ended) el.currentTime = 0;
+      if (el.paused) {
+        const p = el.play();
+        if (p && p.catch) p.catch(() => { });
+      }
+    } catch (e) { }
+  }
+
+  let lastNudge = 0;
+  function nudgePlayer(force) {
+    const t = now();
+    if (!force && t - lastNudge < 30000) return;
+    lastNudge = t;
+    for (const el of document.querySelectorAll('[aria-label*="播放"], button, .jp-play, .btn-play')) {
+      const txt = (el.textContent || '').trim();
+      const al = el.getAttribute('aria-label') || '';
+      if (txt === '播放' || al.indexOf('播放') >= 0) {
+        try { el.click(); } catch (e) { }
+        return;
+      }
+    }
+  }
+
+  function openExerciseTab() {
+    const a = document.querySelector('#btn_top_tab_subject a');
+    if (!a) return false;
+    const li = a.closest('li');
+    if (li && li.classList.contains('active')) return true;
+    try { a.click(); } catch (e) { }
+    return true;
+  }
+
+  function closeBlockers() {
+    const words = ['继续', '确定', '知道了', '关闭', '我知道了', '继续学习'];
+    document.querySelectorAll('.layui-layer, .modal.in, .sweet-alert, [role="dialog"]').forEach(box => {
+      box.querySelectorAll('button, a.btn, .layui-layer-btn0, .layui-layer-close').forEach(el => {
+        const t = (el.textContent || '').trim();
+        if (!t || t.length > 8) return;
+        if (/提交|保存|交卷/.test(t)) return;
+        if (words.some(w => t === w || t.indexOf(w) === 0)) { try { el.click(); } catch (e) { } }
+      });
+    });
+  }
+
+  function fakeActivity() {
+    try {
+      const x = 200 + Math.floor(Math.random() * 400);
+      const y = 200 + Math.floor(Math.random() * 300);
+      ['mousemove', 'mousedown', 'scroll'].forEach(type => {
+        const ev = type === 'scroll' ? new Event('scroll', { bubbles: true })
+          : new MouseEvent(type, { bubbles: true, clientX: x, clientY: y });
+        window.dispatchEvent(ev); document.dispatchEvent(ev);
+      });
+      const kev = new KeyboardEvent('keydown', { bubbles: true, key: 'Shift' });
+      window.dispatchEvent(kev); document.dispatchEvent(kev);
+      window.scrollBy(0, 1); window.scrollBy(0, -1);
+    } catch (e) { }
+  }
+
+  /* ============================ 跳转 ============================ */
+
+  function urlFor(id) {
+    const u = new URL(location.href);
+    u.searchParams.set('courseStructId', id);
+    u.hash = '';
+    return u.toString();
+  }
+  function nextId() { return IDX >= 0 && IDX + 1 < CFG.IDS.length ? CFG.IDS[IDX + 1] : null; }
+  function markDone(id) { if (!doneIds.includes(id)) { doneIds.push(id); lsSet(CFG.KEY_DONE, JSON.stringify(doneIds)); } }
+  function gotoId(id, why) {
+    setBar('run', '跳转中', (why || '') + ' → id=' + id);
+    setTimeout(() => { location.href = urlFor(id); }, 900);
+  }
+  function skipCurrent() {
+    if (IDX < 0) return;
+    markDone(CUR_ID);
+    const nid = nextId();
+    if (nid) gotoId(nid, '已跳过本节');
+    else setBar('run', '全部完成', '已是最后一节（24/24）');
+  }
+
+  /* ============================ 主循环 ============================ */
+
+  let elapsed = 0, lastTick = now(), mediaEl = null, timer = null, actTimer = null, finished = false;
+
+  function startCore() {
+    UI.lastBeat = now();
+
+    if (IDX < 0) {
+      setBar('', '未启用', 'id ' + CUR_ID + ' 不在 Unit1-8 任务列表（真题册页面不跑）');
+      render();
+      setInterval(render, 1000);
+      return;
+    }
+
+    if (doneIds.includes(CUR_ID)) {
+      const nid = nextId();
+      setBar('run', '本节已完成', '已完成 ' + doneIds.length + '/' + CFG.IDS.length + (nid ? '，跳下一节…' : '，全部挂满 🎉'));
+      render();
+      if (nid) gotoId(nid, '跳过已完成');
+      else setInterval(render, 1000);
+      return;
+    }
+
+    UI.btnToggle.textContent = paused ? '继续' : '暂停';
+    setBar(paused ? 'pause' : 'run', paused ? '已暂停' : '运行中',
+      '第 ' + (IDX + 1) + '/' + CFG.IDS.length + ' 节 · id ' + CUR_ID);
+
+    if (CFG.OPEN_EXERCISE_TAB) {
+      setTimeout(() => {
+        openExerciseTab();
+        setTimeout(() => nudgePlayer(true), 1500);
+      }, 1200);
+    }
+
+    timer = setInterval(() => {
+      try {
+        const t = now();
+        const dt = t - lastTick;
+        lastTick = t;
+        UI.ticks++;
+        UI.lastBeat = t;
+
+        if (paused) { setBar('pause', '已暂停', '第 ' + (IDX + 1) + ' 节 · 计时暂停'); render(); return; }
+        if (CFG.COUNT_ONLY_VISIBLE && document.visibilityState !== 'visible') {
+          setBar('pause', '后台暂停', '页面不可见，计时暂停'); render(); return;
+        }
+
+        elapsed += dt;
+
+        mediaEl = mediaEl && mediaEl.isConnected ? mediaEl : findMedia();
+        if (mediaEl) {
+          keepPlaying(mediaEl);
+          const dur = isFinite(mediaEl.duration) ? mediaEl.duration.toFixed(0) : '?';
+          const cur = mediaEl.currentTime.toFixed(0);
+          UI.mediaDesc = mediaEl.tagName.toLowerCase() + ' ' + cur + '/' + dur + 's ' + (mediaEl.paused ? '暂停' : '播放中');
+        } else {
+          nudgePlayer(false);
+          UI.mediaDesc = '未找到 media（本节可能只有图文）';
+        }
+
+        const left = CFG.PER_NODE_SECONDS * 1000 - elapsed;
+        setBar('run', '运行中',
+          '第 ' + (IDX + 1) + '/' + CFG.IDS.length + ' 节 · 剩余 ' + mmss(left) +
+          ' · 已完成 ' + doneIds.length + '/' + CFG.IDS.length +
+          ' · ' + UI.mediaDesc);
+
+        if (left <= 0 && !finished) {
+          finished = true;
+          clearInterval(timer);
+          markDone(CUR_ID);
+          const nid2 = nextId();
+          if (nid2) gotoId(nid2, '本节满 ' + CFG.PER_NODE_SECONDS + ' 秒');
+          else setBar('run', '全部完成', '24 个小节全部挂满 🎉');
+        }
+        render();
+      } catch (e) { fatal(e); }
+    }, 1000);
+
+    actTimer = setInterval(() => {
+      try {
+        if (paused) return;
+        fakeActivity();
+        closeBlockers();
+        mediaEl = mediaEl && mediaEl.isConnected ? mediaEl : findMedia();
+        keepPlaying(mediaEl);
+      } catch (e) { fatal(e); }
+    }, CFG.ACTIVITY_EVERY * 1000);
+
+    render();
+  }
+
+  /* ====================== 启动 + 自愈 ====================== */
+
+  function boot() {
+    try {
+      if (!buildUI()) return false;
+      startCore();
+      setInterval(() => {
+        if (!document.getElementById('mse-auto-bar')) { UI.root = null; buildUI(); }
+        render();
+      }, 3000);
+      return true;
+    } catch (e) { fatal(e); return true; }
+  }
+
+  window.addEventListener('error', ev => {
+    if (ev && ev.message) {
+      UI.err = ev.message + ' @' + String(ev.filename || '').split('/').pop() + ':' + ev.lineno;
+      render();
+    }
+  });
+
+  if (!boot()) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => { if (!boot()) setTimeout(boot, 800); });
+    } else {
+      setTimeout(boot, 800);
+    }
+  }
+
+  window.__MSE_AUTO__ = {
+    version: VERSION, cfg: CFG,
+    state: () => ({ idx: IDX, cur: CUR_ID, elapsed: elapsed, paused: paused, done: doneIds, media: UI.mediaDesc })
+  };
+})();
